@@ -1,4 +1,4 @@
-# iPixel Rhythm — plan
+# iPixel Atom Rhythm — plan
 
 Listen to the room with an **AtomS3 Lite + Atomic Echo Base**, turn the sound into
 11 bar levels, and stream them over BLE to an **iPixel Color LED matrix**, which
@@ -56,7 +56,7 @@ integration for this panel) while testing: the panel accepts only one connection
    If flashing fails, hold the button while plugging in to force download mode.
 5. Smoke test:
    ```powershell
-   cd P:\dev_pr\ipixel-rhythm
+   cd P:\dev_pr\ipixel-atom-rhythm
    idf.py create-project hello
    cd hello
    idf.py set-target esp32s3
@@ -69,7 +69,7 @@ integration for this panel) while testing: the panel accepts only one connection
 ## 3. Project layout
 
 ```
-ipixel-rhythm/
+ipixel-atom-rhythm/
   plan.md
   CMakeLists.txt
   sdkconfig.defaults
