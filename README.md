@@ -148,13 +148,23 @@ and every command starts with its 2-byte length.
 | Power on / off | `05 00 07 01 <1/0>` |
 | Time sync (reply has the panel type) | `08 00 01 80 hh mm ss 00` |
 
-**Self-draw.** Each frame only sends pixels that changed. Writes without a
-response can be dropped silently, so each frame also rewrites one bar's whole
-column, cycling through the bars. A stale pixel is cleared within about 0.8 s.
+**Self-draw.** Each frame only sends pixels that changed, at most 240 per
+frame; changes that don't fit follow in the next frames. Pixel commands carry
+up to 60 pixels and are written *with response*, so the panel confirms each
+one before the next is sent, as ipixel-ble does. Fire-and-forget writes were
+fine on a 48 x 24 panel but a 192 x 32 panel dropped most of them. The
+trade-off is speed: self-draw runs at about 5-6 frames a second on a 192 x 32
+panel, set by how fast the panel confirms. Each frame also rewrites one bar's
+whole column when there is room, cycling through the bars, to clear any stale
+pixel. If a write fails, only the bars involved are redrawn.
 
 **Panel size.** After connecting, the Atom turns on notifications and sends a
 time sync. The reply's device-type byte gives the panel size (for example
-137 = 48 x 24, 143 = 192 x 32).
+137 = 48 x 24, 143 = 192 x 32). Some panels don't always answer, so the Atom
+waits up to 6 s, asking every 2 s, before sending anything else. Each size a
+panel reports is saved with its address; if a panel doesn't answer, the saved
+size is used. A panel that has never reported its size shows the music screen
+in style 5.
 
 ## Tuning
 
@@ -169,6 +179,7 @@ Settings are `#define`s at the top of these files:
 | `main/bands.c` | `LOW_HZ`, `HIGH_HZ` | Frequency range |
 | `main/audio.c` | `MIC_PGA`, `MIC_DIGITAL_GAIN` | Microphone gain |
 | `main/draw.c` | `RGB`, `zone()` | Self-draw colours and where they change |
+| `main/draw.c` | `MAX_POINTS`, `DRAW_FRAME_POINTS` | Pixels per command and per frame in self-draw |
 | `main/main.c` | `FRAME_MS` | Frame interval (50 ms = 20 fps) |
 | `main/main.c` | `SILENCE_FRAMES` | Frames of quiet before pausing |
 
@@ -179,6 +190,8 @@ Settings are `#define`s at the top of these files:
   again from the phone app or Home Assistant if you use the panel's clock.
 * Panels wider than 255 pixels (types 144-147) can't be self-drawn: pixel
   coordinates are single bytes. The panel's own music screen still works.
+* Self-draw is slower on big panels (about 5-6 frames a second on 192 x 32)
+  because each pixel command waits for the panel to confirm it.
 * If the panel has a password set in the phone app, it may ignore commands.
 * The code is written for the AtomS3 Lite + Echo Base pins. Other ESP32-S3
   boards need the pins in `main/audio.c` and `main/ui.c` changed.
@@ -193,7 +206,7 @@ main/
   ipixel.c        NimBLE central: scan, connect, discover, notifications, panel size
   ipixel_proto.h  music-screen, brightness and power commands
   draw.c          self-draw: live drawing mode, changed-pixel updates, column refresh
-  settings.c      NVS: style, brightness, panel address
+  settings.c      NVS: style, brightness, panel address, panel size per address
   ui.c            button and status LED
 plan.md           original plan and progress notes
 ```

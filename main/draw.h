@@ -12,6 +12,7 @@ static inline int draw_bar_count(int width) { return width / 3; }
 int draw_enter(void);
 // Leave drawing mode; the panel goes back to its saved program.
 int draw_leave(void);
-// Send only the pixels that changed since the last frame. Returns 0, or a
-// NimBLE error (then call draw_enter() again to redraw from scratch).
+// Send the pixels that changed since the last frame, at most a fixed number per
+// frame (the rest follow in later frames). Returns 0, or a NimBLE error; on an
+// error the bars involved are redrawn in full over the next frames.
 int draw_frame(const uint8_t *heights, int count, int width, int height);

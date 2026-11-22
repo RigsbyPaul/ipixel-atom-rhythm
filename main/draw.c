@@ -1,6 +1,6 @@
 // Live drawing on the iPixel panel (ipixel-ble build_diy_mode / build_diy_pixels):
 //   enter/leave: 05 00 04 01 <mode>   (1 = enter on cleared screen, 0 = leave, discard)
-//   pixels:      <len lo> <len hi> 05 01 00 R G B x0 y0 x1 y1 ...   (<= 200 points)
+//   pixels:      <len lo> <len hi> 05 01 00 R G B x0 y0 x1 y1 ...   (we send <= 60 points)
 // x from the left, y from the top.
 #include "draw.h"
 
@@ -8,7 +8,11 @@
 #include "bands.h"
 #include "ipixel.h"
 
-#define MAX_POINTS 200
+// Every self-draw command is written with response (the panel confirms each one),
+// like ipixel-ble: a 192 x 32 panel dropped most fire-and-forget pixel writes.
+#define MAX_POINTS 60          // per pixel command: 128-byte writes (ipixel-ble allows 200)
+#define DRAW_FRAME_POINTS 240  // per frame, whatever the panel size
+#define UNKNOWN 0xFF           // s_shown value: we don't know what this bar shows
 
 enum { C_BLACK, C_GREEN, C_YELLOW, C_RED, C_COUNT };
 static const uint8_t RGB[C_COUNT][3] = {
@@ -26,7 +30,7 @@ static batch_t s_batch[C_COUNT];
 static int mode(uint8_t m)
 {
     uint8_t c[5] = {5, 0, 4, 1, m};
-    return ipixel_write(c, sizeof c);
+    return ipixel_write_confirmed(c, sizeof c);
 }
 
 int draw_enter(void)
@@ -49,7 +53,7 @@ static int flush(int colour)
     b->buf[4] = 0;
     memcpy(b->buf + 5, RGB[colour], 3);
     b->n = 0;
-    return ipixel_write(b->buf, len);
+    return ipixel_write_confirmed(b->buf, len);
 }
 
 static int add(int colour, int x, int y)
@@ -68,41 +72,74 @@ static int zone(int row, int height)  // row 0 = bottom
     return C_GREEN;
 }
 
+// Queue the rows from..to-1 of bar i (2 pixels per row).
+static int queue_rows(int i, int from, int to, int want, int height)
+{
+    int rc = 0;
+    int x = i * 3;
+    for (int r = from; r < to && rc == 0; r++) {
+        int colour = r < want ? zone(r, height) : C_BLACK;
+        int y = height - 1 - r;
+        rc = add(colour, x, y);
+        if (rc == 0) rc = add(colour, x + 1, y);
+    }
+    return rc;
+}
+
 int draw_frame(const uint8_t *heights, int count, int width, int height)
 {
-    static int s_heal;  // bar whose whole column is rewritten this frame
-    int rc = 0;
+    static int s_next;  // bar to start from, so no bar is always left until last
+    static int s_heal;  // bar whose whole column is rewritten when there is room
+    static uint8_t touched[BANDS_MAX];
+    int rc = 0, used = 0, ntouched = 0;
     if (count > draw_bar_count(width)) count = draw_bar_count(width);
     if (count <= 0) return 0;
-    int heal = s_heal++ % count;
-    for (int i = 0; i < count && rc == 0; i++) {
+
+    // Changed rows only (grow lights have..want-1, shrink clears want..have-1),
+    // at most DRAW_FRAME_POINTS per frame. Bars that don't fit keep their old
+    // s_shown value and are sent next frame, so a busy frame on a big panel
+    // spreads over a few frames instead of flooding the link.
+    int start = s_next % count;
+    int k;
+    for (k = 0; k < count && rc == 0; k++) {
+        int i = (start + k) % count;
         int want = heights[i] > height ? height : heights[i];
         int have = s_shown[i];
-        int x = i * 3;
-        // Normally only the change: grow lights rows have..want-1, shrink clears
-        // rows want..have-1. Writes without response can be dropped silently, so
-        // one bar per frame is rewritten top to bottom to wipe out stale pixels.
         int from, to;
-        if (i == heal) {
+        if (have == UNKNOWN) {
             from = 0;
             to = height;
         } else {
             from = want > have ? have : want;
             to = want > have ? want : have;
         }
-        for (int r = from; r < to && rc == 0; r++) {
-            int colour = r < want ? zone(r, height) : C_BLACK;
-            int y = height - 1 - r;
-            rc = add(colour, x, y);
-            if (rc == 0) rc = add(colour, x + 1, y);
-        }
+        int need = 2 * (to - from);
+        if (need == 0) continue;
+        if (used > 0 && used + need > DRAW_FRAME_POINTS) break;
+        rc = queue_rows(i, from, to, want, height);
+        used += need;
         s_shown[i] = (uint8_t)want;
+        touched[ntouched++] = (uint8_t)i;
     }
+    s_next = start + k;
+
+    // Writes without response can be dropped silently: when there is room,
+    // rewrite one more bar's whole column to wipe out any stale pixels.
+    if (rc == 0 && used + 2 * height <= DRAW_FRAME_POINTS) {
+        int i = s_heal++ % count;
+        int want = heights[i] > height ? height : heights[i];
+        rc = queue_rows(i, 0, height, want, height);
+        s_shown[i] = (uint8_t)want;
+        touched[ntouched++] = (uint8_t)i;
+    }
+
     // Clear first, then paint, so a shrinking-then-growing bar never shows a gap.
     if (rc == 0) rc = flush(C_BLACK);
     for (int c = C_GREEN; c < C_COUNT && rc == 0; c++) rc = flush(c);
     if (rc != 0) {
+        // Some of this frame's pixels never left: redraw those bars in full later.
         for (int c = 0; c < C_COUNT; c++) s_batch[c].n = 0;
+        for (int t = 0; t < ntouched; t++) s_shown[touched[t]] = UNKNOWN;
     }
     return rc;
 }

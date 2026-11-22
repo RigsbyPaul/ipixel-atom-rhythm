@@ -26,5 +26,18 @@ ipixel_state_t ipixel_state(void);
 bool ipixel_ready(void);
 // Panel size read from its time-sync reply at connect; false until known.
 bool ipixel_panel_size(int *width, int *height);
+// Called (from the BLE task) when the connected panel reports its size.
+typedef void (*ipixel_size_cb)(const ipixel_addr_t *addr, int width, int height);
+void ipixel_on_size(ipixel_size_cb cb);
+// Address of the connected panel; false when not connected.
+bool ipixel_connected_addr(ipixel_addr_t *addr);
+// Use a size from elsewhere (e.g. saved earlier) until the panel reports one.
+void ipixel_set_panel_size(int width, int height);
+// Ask the panel for its size again (time sync; sets the panel clock to 00:00).
+void ipixel_request_panel_size(void);
 // Write one command to fa02. Returns 0 on success, a NimBLE error otherwise.
 int ipixel_write(const uint8_t *data, size_t len);
+// Write with response and wait for the panel to confirm (falls back to
+// ipixel_write if the panel only offers write without response). Blocks; don't
+// call from the BLE task.
+int ipixel_write_confirmed(const uint8_t *data, size_t len);

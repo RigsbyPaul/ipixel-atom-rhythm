@@ -6,6 +6,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
@@ -21,6 +22,7 @@ static const char *TAG = "ipixel";
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_write_handle;
 static bool s_write_no_rsp;
+static bool s_write_has_rsp;  // fa02 also offers write with response
 static volatile bool s_ready;
 static uint8_t s_own_addr_type;
 static volatile ipixel_state_t s_state = IPIXEL_SCANNING;
@@ -31,6 +33,8 @@ static ipixel_found_cb s_on_found;
 static uint16_t s_notify_handle, s_cccd_handle;
 static volatile int s_width, s_height;  // 0 until the panel has told us
 static volatile uint8_t s_panel_type;
+static ipixel_addr_t s_conn_addr;  // address of the panel we're connected to
+static ipixel_size_cb s_on_size;
 
 // Panel size by the device-type byte of the time-sync reply (ipixel-ble PANEL_SIZES).
 static const struct { uint8_t type, w, h; } PANEL_SIZES[] = {
@@ -63,6 +67,21 @@ bool ipixel_ready(void) { return s_ready; }
 
 ipixel_state_t ipixel_state(void) { return s_state; }
 
+void ipixel_on_size(ipixel_size_cb cb) { s_on_size = cb; }
+
+bool ipixel_connected_addr(ipixel_addr_t *addr)
+{
+    if (!s_ready) return false;
+    *addr = s_conn_addr;
+    return true;
+}
+
+void ipixel_set_panel_size(int w, int h)
+{
+    s_width = w;
+    s_height = h;
+}
+
 bool ipixel_panel_size(int *w, int *h)
 {
     *w = s_width;
@@ -88,6 +107,44 @@ int ipixel_write(const uint8_t *data, size_t len)
     return 0;
 }
 
+static SemaphoreHandle_t s_write_done;
+static volatile int s_write_status;
+
+static int on_write_done(uint16_t conn, const struct ble_gatt_error *err,
+                         struct ble_gatt_attr *attr, void *arg)
+{
+    s_write_status = err->status;
+    xSemaphoreGive(s_write_done);
+    return 0;
+}
+
+// Write with response, waiting for the panel to confirm each chunk. This is what
+// ipixel-ble does when the characteristic offers "write": the panel paces the
+// sender, so nothing is dropped. Must not be called from the BLE host task.
+int ipixel_write_confirmed(const uint8_t *data, size_t len)
+{
+    if (!s_ready) {
+        return BLE_HS_ENOTCONN;
+    }
+    if (!s_write_has_rsp) {
+        return ipixel_write(data, len);  // panel only offers write without response
+    }
+    if (!s_write_done) {
+        s_write_done = xSemaphoreCreateBinary();
+    }
+    size_t chunk = ble_att_mtu(s_conn) - 3;
+    if (chunk < 20) chunk = 20;
+    for (size_t off = 0; off < len; off += chunk) {
+        size_t n = len - off < chunk ? len - off : chunk;
+        xSemaphoreTake(s_write_done, 0);  // drop any stale completion
+        int rc = ble_gattc_write_flat(s_conn, s_write_handle, data + off, n, on_write_done, NULL);
+        if (rc != 0) return rc;
+        if (xSemaphoreTake(s_write_done, pdMS_TO_TICKS(1000)) != pdTRUE) return BLE_HS_ETIMEOUT;
+        if (s_write_status != 0) return s_write_status;
+    }
+    return 0;
+}
+
 static void set_ready(void)
 {
     s_ready = true;
@@ -98,10 +155,14 @@ static void set_ready(void)
 
 // Time sync: the panel replies with its device info (byte 4 = panel type).
 // The Atom has no clock, so this sets the panel's clock to 00:00:00.
-static void ask_panel_info(void)
+void ipixel_request_panel_size(void)
 {
     static const uint8_t sync[8] = {8, 0, 1, 0x80, 0, 0, 0, 0};
-    ipixel_write(sync, sizeof sync);
+    if (!s_ready) return;
+    // Write with response when the panel offers it, like ipixel-ble: a 192 x 32
+    // panel ignored this request when sent as write-without-response.
+    int rc = ble_gattc_write_flat(s_conn, s_write_handle, sync, sizeof sync, NULL, NULL);
+    ESP_LOGI(TAG, "time sync sent with response (rc %d)", rc);
 }
 
 static int on_cccd_written(uint16_t conn, const struct ble_gatt_error *err,
@@ -109,7 +170,7 @@ static int on_cccd_written(uint16_t conn, const struct ble_gatt_error *err,
 {
     ESP_LOGI(TAG, "notifications %s", err->status == 0 ? "on" : "failed");
     set_ready();
-    if (err->status == 0) ask_panel_info();
+    if (err->status == 0) ipixel_request_panel_size();
     return 0;
 }
 
@@ -139,6 +200,7 @@ static int on_chr(uint16_t conn, const struct ble_gatt_error *err,
         if (uuid_is16(&chr->uuid.u, UUID_WRITE)) {
             s_write_handle = chr->val_handle;
             s_write_no_rsp = (chr->properties & BLE_GATT_CHR_PROP_WRITE_NO_RSP) != 0;
+            s_write_has_rsp = (chr->properties & BLE_GATT_CHR_PROP_WRITE) != 0;
             ESP_LOGI(TAG, "fa02 at handle %u, props 0x%02x (%s)", chr->val_handle,
                      chr->properties, s_write_no_rsp ? "write without response" : "write");
         } else if (uuid_is16(&chr->uuid.u, UUID_NOTIFY)) {
@@ -227,6 +289,14 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
             return 0;
         }
         s_conn = ev->connect.conn_handle;
+        {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(s_conn, &desc) == 0) {
+                s_conn_addr.type = desc.peer_id_addr.type;
+                memcpy(s_conn_addr.val, desc.peer_id_addr.val, 6);
+            }
+        }
+        s_width = s_height = 0;  // learn this panel's size afresh
         ESP_LOGI(TAG, "connected");
         ble_gattc_exchange_mtu(s_conn, on_mtu, NULL);
         return 0;
@@ -264,11 +334,12 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
             s_height = h;
             if (w) {
                 ESP_LOGI(TAG, "panel type %u: %d x %d", buf[4], w, h);
+                if (s_on_size) s_on_size(&s_conn_addr, w, h);
             } else {
                 ESP_LOGW(TAG, "panel type %u: size not supported", buf[4]);
             }
         } else {
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, buf, n, ESP_LOG_DEBUG);
+            ESP_LOG_BUFFER_HEX_LEVEL(TAG, buf, n, ESP_LOG_INFO);
         }
         return 0;
     }
