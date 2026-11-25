@@ -1,7 +1,8 @@
 // AtomS3 Lite button (G41, active low) and WS2812 status LED (G35).
 // LED: blue blinking = scanning, yellow = connecting, steady = connected in the
-// current style's colour (green, cyan, magenta, orange, red, purple for styles 0..5),
-// white flash = button press acknowledged.
+// current style's colour (STYLE_RGB). Disco styles 6..11 show their colour for
+// 1 s after a press and while the panel is dark, and otherwise follow the
+// panel's average colour. White flash = button press acknowledged.
 #include "ui.h"
 
 #include "driver/gpio.h"
@@ -23,19 +24,45 @@ static ui_press_cb s_on_press;
 static volatile int s_flash_ticks;
 static volatile uint8_t s_style;
 
-// Connected colour for each rhythm style 0..4 (kept clear of scanning blue and
-// connecting yellow).
-static const uint8_t STYLE_RGB[6][3] = {
-    {0, 14, 0},   // 0 green
-    {0, 12, 12},  // 1 cyan
-    {16, 0, 14},  // 2 magenta
-    {24, 6, 0},   // 3 orange
-    {22, 0, 2},   // 4 red
-    {10, 0, 25},  // 5 purple (self-draw)
+// Connected colour for each style (kept clear of scanning blue and connecting
+// yellow). Disco styles 6..11 show theirs for a second after a press, and
+// whenever the panel is dark; otherwise the LED follows the panel.
+#define STYLES 12
+static const uint8_t STYLE_RGB[STYLES][3] = {
+    {0, 14, 0},    // 0 green
+    {0, 12, 12},   // 1 cyan
+    {16, 0, 14},   // 2 magenta
+    {24, 6, 0},    // 3 orange
+    {22, 0, 2},    // 4 red
+    {10, 0, 25},   // 5 purple (self-draw)
+    {12, 25, 0},   // 6 lime (colour wash)
+    {25, 2, 10},   // 7 pink (beat flash)
+    {4, 12, 25},   // 8 sky blue (bass pulse)
+    {14, 8, 25},   // 9 lavender (spectrum glow)
+    {25, 18, 10},  // 10 warm white (sparkle)
+    {6, 25, 14},   // 11 mint (rainbow chase)
 };
+#define HOLD_TICKS (1000 / TICK_MS)  // show the fixed colour for 1 s after a press
 
 void ui_flash(void) { s_flash_ticks = 5; }
-void ui_set_style(uint8_t style) { s_style = style % 6; }
+static volatile uint8_t s_live[3];
+static volatile uint32_t s_live_gen;
+static volatile int s_hold_ticks;
+
+void ui_set_style(uint8_t style)
+{
+    s_style = style < STYLES ? style : 0;
+    s_hold_ticks = HOLD_TICKS;
+}
+
+void ui_set_live_colour(uint8_t r, uint8_t g, uint8_t b)
+{
+    // The LED is far brighter than the panel's glow: scale it down.
+    s_live[0] = r / 8;
+    s_live[1] = g / 8;
+    s_live[2] = b / 8;
+    s_live_gen++;
+}
 
 static void set(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -71,13 +98,24 @@ static void ui_task(void *arg)
         }
 
         // LED.
+        if (s_hold_ticks > 0) s_hold_ticks--;
         int colour;
         if (s_flash_ticks > 0) {
             s_flash_ticks--;
             colour = 3;
         } else {
             switch (ipixel_state()) {
-            case IPIXEL_READY: colour = 10 + s_style; break;
+            case IPIXEL_READY: {
+                // Disco styles follow the panel's colour, except for 1 s after a
+                // press and while the panel is dark (quiet, faded, or no size yet).
+                bool dark = s_live[0] + s_live[1] + s_live[2] == 0;
+                if (s_style < 6 || s_hold_ticks > 0 || dark) {
+                    colour = 10 + s_style;
+                } else {
+                    colour = 100 + (int)(s_live_gen & 0x7FFF);
+                }
+                break;
+            }
             case IPIXEL_CONNECTING: colour = 1; break;
             default: colour = (tick / 25) % 2 ? 0 : 4; break;  // blink blue, 1 Hz
             }
@@ -89,11 +127,14 @@ static void ui_task(void *arg)
             case 1: set(20, 14, 0); break;
             case 3: set(30, 30, 30); break;
             case 4: set(0, 0, 25); break;
-            default: {
-                const uint8_t *c = STYLE_RGB[colour - 10];
-                set(c[0], c[1], c[2]);
+            default:
+                if (colour >= 100) {
+                    set(s_live[0], s_live[1], s_live[2]);
+                } else {
+                    const uint8_t *c = STYLE_RGB[colour - 10];
+                    set(c[0], c[1], c[2]);
+                }
                 break;
-            }
             }
         }
     }

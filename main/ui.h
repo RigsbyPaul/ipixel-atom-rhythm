@@ -10,3 +10,5 @@ void ui_start(ui_press_cb on_press);
 void ui_flash(void);
 // Set the style whose colour the LED shows while connected (0..4).
 void ui_set_style(uint8_t style);
+// For disco styles (6..11) the connected LED shows this colour: the panel's average.
+void ui_set_live_colour(uint8_t r, uint8_t g, uint8_t b);

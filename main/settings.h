@@ -4,7 +4,7 @@
 #include "ipixel.h"
 
 typedef struct {
-    uint8_t style;       // 0..4 panel music screen, 5 self-draw
+    uint8_t style;       // 0..4 panel music screen, 5 self-draw, 6..11 disco
     uint8_t brightness;  // 0..100
     bool have_panel;
     ipixel_addr_t panel;

@@ -339,7 +339,15 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
                 ESP_LOGW(TAG, "panel type %u: size not supported", buf[4]);
             }
         } else {
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, buf, n, ESP_LOG_INFO);
+            // Acks: 05 00 <type> 00 <status>, status 0 invalid, 1 next frame,
+            // 2 no space, 3 complete. Log only changes, not every frame.
+            static int last_ack = -1;
+            int key = ack ? (buf[2] << 8 | buf[4]) : -2;
+            if (key != last_ack) {
+                last_ack = key;
+                ESP_LOGI(TAG, "panel reply changed:");
+                ESP_LOG_BUFFER_HEX(TAG, buf, n);
+            }
         }
         return 0;
     }
