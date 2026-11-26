@@ -1,8 +1,8 @@
 // AtomS3 Lite button (G41, active low) and WS2812 status LED (G35).
 // LED: blue blinking = scanning, yellow = connecting, steady = connected in the
-// current style's colour (STYLE_RGB). Disco styles 6..11 show their colour for
-// 1 s after a press and while the panel is dark, and otherwise follow the
-// panel's average colour. White flash = button press acknowledged.
+// current style's colour (STYLE_RGB). Disco (style 6) shows its colour for
+// 1 s after a press and while the panel is dark, and otherwise pulses white
+// with the panel's brightness. White flash = button press acknowledged.
 #include "ui.h"
 
 #include "driver/gpio.h"
@@ -25,9 +25,9 @@ static volatile int s_flash_ticks;
 static volatile uint8_t s_style;
 
 // Connected colour for each style (kept clear of scanning blue and connecting
-// yellow). Disco styles 6..11 show theirs for a second after a press, and
-// whenever the panel is dark; otherwise the LED follows the panel.
-#define STYLES 12
+// yellow). Disco (6) shows its colour for a second after a press, and whenever
+// the panel is dark; otherwise the LED follows the panel's brightness.
+#define STYLES 7
 static const uint8_t STYLE_RGB[STYLES][3] = {
     {0, 14, 0},    // 0 green
     {0, 12, 12},   // 1 cyan
@@ -35,12 +35,7 @@ static const uint8_t STYLE_RGB[STYLES][3] = {
     {24, 6, 0},    // 3 orange
     {22, 0, 2},    // 4 red
     {10, 0, 25},   // 5 purple (self-draw)
-    {12, 25, 0},   // 6 lime (colour wash)
-    {25, 2, 10},   // 7 pink (beat flash)
-    {4, 12, 25},   // 8 sky blue (bass pulse)
-    {14, 8, 25},   // 9 lavender (spectrum glow)
-    {25, 18, 10},  // 10 warm white (sparkle)
-    {6, 25, 14},   // 11 mint (rainbow chase)
+    {12, 25, 0},   // 6 lime (disco)
 };
 #define HOLD_TICKS (1000 / TICK_MS)  // show the fixed colour for 1 s after a press
 

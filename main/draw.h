@@ -4,7 +4,7 @@
 
 // Self-drawn bars using the panel's live drawing (DIY) mode.
 // Bars are 2 pixels wide with a 1-pixel gap, so a panel w wide shows w/3 bars,
-// each 0..h pixels tall, green / yellow / red from the bottom up.
+// each 1..h pixels tall (1 = silence), green / yellow / red from the bottom up.
 
 static inline int draw_bar_count(int width) { return width / 3; }
 

@@ -104,6 +104,7 @@ int draw_frame(const uint8_t *heights, int count, int width, int height)
     for (k = 0; k < count && rc == 0; k++) {
         int i = (start + k) % count;
         int want = heights[i] > height ? height : heights[i];
+        if (want < 1) want = 1;  // silence shows as a 1-pixel line along the bottom
         int have = s_shown[i];
         int from, to;
         if (have == UNKNOWN) {
@@ -128,6 +129,7 @@ int draw_frame(const uint8_t *heights, int count, int width, int height)
     if (rc == 0 && used + 2 * height <= DRAW_FRAME_POINTS) {
         int i = s_heal++ % count;
         int want = heights[i] > height ? height : heights[i];
+        if (want < 1) want = 1;  // silence shows as a 1-pixel line along the bottom
         rc = queue_rows(i, 0, height, want, height);
         s_shown[i] = (uint8_t)want;
         touched[ntouched++] = (uint8_t)i;

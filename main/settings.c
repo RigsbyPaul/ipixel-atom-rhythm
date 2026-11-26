@@ -22,7 +22,7 @@ void settings_load(settings_t *s)
     size_t len = sizeof s->panel;
     s->have_panel = nvs_get_blob(h, "panel", &s->panel, &len) == ESP_OK && len == sizeof s->panel;
     nvs_close(h);
-    if (s->style > 11) s->style = 0;  // 5 = self-draw, 6..11 disco
+    if (s->style > 6) s->style = 0;  // 5 = self-draw, 6 = disco
     if (s->brightness > 100) s->brightness = 60;
     ESP_LOGI(TAG, "style %u, brightness %u, saved panel: %s", s->style, s->brightness,
              s->have_panel ? "yes" : "no");
@@ -94,3 +94,4 @@ bool settings_load_panel_size(const ipixel_addr_t *addr, int *width, int *height
     *height = v & 0xFF;
     return true;
 }
+
