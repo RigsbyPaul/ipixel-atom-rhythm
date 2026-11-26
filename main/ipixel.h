@@ -41,3 +41,11 @@ int ipixel_write(const uint8_t *data, size_t len);
 // ipixel_write if the panel only offers write without response). Blocks; don't
 // call from the BLE task.
 int ipixel_write_confirmed(const uint8_t *data, size_t len);
+// Write without response, waiting for NimBLE buffers instead of failing when
+// they run out (big blocks). Blocks; don't call from the BLE task.
+int ipixel_write_paced(const uint8_t *data, size_t len);
+// Frame acks (05 00 <type> 00 <status>): arm before writing, then wait.
+// Returns the status (0 invalid, 1 next frame, 2 no space, 3 complete) or -1
+// on timeout.
+void ipixel_ack_arm(void);
+int ipixel_ack_wait(int timeout_ms);

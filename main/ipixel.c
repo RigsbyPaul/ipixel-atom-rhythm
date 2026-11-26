@@ -45,6 +45,19 @@ static const struct { uint8_t type, w, h; } PANEL_SIZES[] = {
 };  // 144..147 are 256..448 wide: too wide for single-byte x, treated as unknown
 
 static void start_scan(void);
+
+// Short connection interval (7.5..15 ms, NimBLE's default is 30..50 ms): live
+// frames are 18 KB each, so how often packets can go decides the frame rate.
+static const struct ble_gap_conn_params CONN_PARAMS = {
+    .scan_itvl = 0x50,
+    .scan_window = 0x30,
+    .itvl_min = 6,   // x 1.25 ms
+    .itvl_max = 12,
+    .latency = 0,
+    .supervision_timeout = 400,  // x 10 ms
+    .min_ce_len = 0,
+    .max_ce_len = 0,
+};
 static void reconnect(void);
 
 // Accept a 16-bit UUID in either its short or full 128-bit (base UUID) form.
@@ -105,6 +118,46 @@ int ipixel_write(const uint8_t *data, size_t len)
         if (rc != 0) return rc;
     }
     return 0;
+}
+
+// Like ipixel_write (without response), but when NimBLE runs out of buffers
+// wait for them to drain instead of failing: for big blocks like raw frames.
+int ipixel_write_paced(const uint8_t *data, size_t len)
+{
+    if (!s_ready) {
+        return BLE_HS_ENOTCONN;
+    }
+    if (!s_write_no_rsp) {
+        return ipixel_write_confirmed(data, len);
+    }
+    size_t chunk = ble_att_mtu(s_conn) - 3;
+    if (chunk < 20) chunk = 20;
+    for (size_t off = 0; off < len; off += chunk) {
+        size_t n = len - off < chunk ? len - off : chunk;
+        int rc, tries = 0;
+        while ((rc = ble_gattc_write_no_rsp_flat(s_conn, s_write_handle, data + off, n)) == BLE_HS_ENOMEM &&
+               ++tries < 500) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+        }
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
+static SemaphoreHandle_t s_ack_sem;
+static volatile int s_ack_status = -1;
+
+void ipixel_ack_arm(void)
+{
+    if (!s_ack_sem) s_ack_sem = xSemaphoreCreateBinary();
+    xSemaphoreTake(s_ack_sem, 0);  // drop any stale ack
+    s_ack_status = -1;
+}
+
+int ipixel_ack_wait(int timeout_ms)
+{
+    if (!s_ack_sem || xSemaphoreTake(s_ack_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) return -1;
+    return s_ack_status;
 }
 
 static SemaphoreHandle_t s_write_done;
@@ -274,7 +327,7 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
             s_on_found(&a);
         }
         s_state = IPIXEL_CONNECTING;
-        int rc = ble_gap_connect(s_own_addr_type, &ev->disc.addr, 10000, NULL, gap_event, NULL);
+        int rc = ble_gap_connect(s_own_addr_type, &ev->disc.addr, 10000, &CONN_PARAMS, gap_event, NULL);
         if (rc != 0) {
             ESP_LOGE(TAG, "connect failed to start: %d", rc);
             start_scan();
@@ -342,6 +395,10 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
             // Acks: 05 00 <type> 00 <status>, status 0 invalid, 1 next frame,
             // 2 no space, 3 complete. Log only changes, not every frame.
             static int last_ack = -1;
+            if (ack) {
+                s_ack_status = buf[4];
+                if (s_ack_sem) xSemaphoreGive(s_ack_sem);
+            }
             int key = ack ? (buf[2] << 8 | buf[4]) : -2;
             if (key != last_ack) {
                 last_ack = key;
@@ -381,7 +438,7 @@ static void reconnect(void)
                  s_known.val[5], s_known.val[4], s_known.val[3], s_known.val[2],
                  s_known.val[1], s_known.val[0], s_direct_failures + 1);
         s_state = IPIXEL_CONNECTING;
-        int rc = ble_gap_connect(s_own_addr_type, &s_known, 5000, NULL, gap_event, NULL);
+        int rc = ble_gap_connect(s_own_addr_type, &s_known, 5000, &CONN_PARAMS, gap_event, NULL);
         if (rc == 0) {
             return;
         }

@@ -1,6 +1,8 @@
 // iPixel Rhythm: Echo Base mic -> frequency bands -> bars on the iPixel panel over BLE.
 // Styles 0..4 use the panel's own rhythm screen (11 levels, panel decides the layout).
 // Style 5 draws width/3 bars itself in the panel's live drawing mode.
+// Style 6 is live disco: whole-panel pictures of the music (disco.c) sent as
+// raw RGB live frames in the panel's DIY mode (live.c).
 #include <string.h>
 #include "esp_log.h"
 #include "esp_system.h"
@@ -13,6 +15,7 @@
 #include "bands.h"
 #include "draw.h"
 #include "fx.h"
+#include "disco.h"
 #include "live.h"
 #include "ipixel.h"
 #include "ipixel_proto.h"
@@ -23,12 +26,14 @@ static const char *TAG = "main";
 
 #define FRAME_MS 50         // 20 fps to the panel; ipixel-ble uses 400 ms
 #define SILENCE_S 10        // seconds of empty bars before streaming stops
-#define FADE_STEPS 8        // disco frames to fade to black when it goes quiet
 #define LOG_EVERY 8         // blocks (~0.25 s) between level prints
+#define DRAWN_TILT_DB 10.0f  // style 5 treble lift across all bars
 #define STATUS_MS 5000      // status line interval
 #define STYLE_SELF_DRAW IPIXEL_RHYTHM_STYLES  // 5
-#define STYLE_DISCO (STYLE_SELF_DRAW + 1)        // 6..11: whole-panel disco effects
-#define STYLE_COUNT (STYLE_DISCO + FX_COUNT)
+#define STYLE_DISCO (STYLE_SELF_DRAW + 1)        // 6: saved animation pulsed by the music
+#define STYLE_COUNT (STYLE_DISCO + 1)
+
+enum { DRAW_NONE, DRAW_BARS, DRAW_DISCO };
 
 static const uint8_t BRIGHTNESS_STEPS[] = {20, 40, 60, 80, 100};
 static volatile uint8_t s_style;
@@ -61,6 +66,7 @@ static void audio_task(void *arg)
         taskENTER_CRITICAL(&s_lock);
         memcpy(s_native, lv, IPIXEL_RHYTHM_BARS);
         taskEXIT_CRITICAL(&s_lock);
+        fx_listen(lv, (float)BANDS_FFT_SIZE / AUDIO_SAMPLE_RATE);  // every block, so no beat is missed
 
         // Self-draw bands follow the panel size it reported at connect.
         int w, h;
@@ -69,6 +75,9 @@ static void audio_task(void *arg)
                 drawn_w = w;
                 drawn_h = h;
                 bands_init(&drawn, draw_bar_count(w), h);
+                // Less treble lift than the music screen (16.5 dB): the right-hand
+                // bars were too lively.
+                drawn.tilt = drawn.count > 1 ? DRAWN_TILT_DB / (drawn.count - 1) : 0;
                 ESP_LOGI(TAG, "self-draw: %d bars x %d px", drawn.count, h);
             }
             bands_levels(&drawn, silent, lv);
@@ -99,10 +108,8 @@ static void on_press(ui_press_t press)
         s_style = (s_style + 1) % STYLE_COUNT;
         ui_set_style(s_style);
         settings_save_style(s_style);
-        static const char *const fx_names[FX_COUNT] = {"colour wash", "beat flash", "bass pulse",
-                                                       "spectrum glow", "sparkle", "rainbow chase"};
-        ESP_LOGI(TAG, "style %u%s%s", s_style, s_style == STYLE_SELF_DRAW ? " (self-draw)" : "",
-                 s_style >= STYLE_DISCO ? fx_names[s_style - STYLE_DISCO] : "");
+        ESP_LOGI(TAG, "style %u%s", s_style,
+                 s_style == STYLE_SELF_DRAW ? " (self-draw)" : s_style == STYLE_DISCO ? " (disco)" : "");
     } else {
         int next = 0;
         for (int i = 0; i < (int)sizeof BRIGHTNESS_STEPS; i++) {
@@ -129,10 +136,9 @@ static void send_task(void *arg)
     uint8_t drawn[BANDS_MAX];
     uint8_t cmd[IPIXEL_RHYTHM_LEN];
     bool was_ready = false;
-    bool drawing = false;  // panel is in live drawing mode
+    int drawing = DRAW_NONE;  // what the panel is in live drawing mode for
     bool idle = false;
     float quiet_s = 0;
-    int fade_left = 0;  // disco frames left in the fade to black
     uint32_t sent = 0, failed = 0;
     int last_err = 0;
     TickType_t last = xTaskGetTickCount();
@@ -141,13 +147,14 @@ static void send_task(void *arg)
     int size_tries = 0;
     bool started = false;  // size settled and power/brightness sent for this connection
     int64_t last_us = esp_timer_get_time();
-    uint32_t live_frames = 0;
+    uint32_t disco_frames = 0;
+    int64_t disco_last_us = 0;
 
     for (;;) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(FRAME_MS));
         if (!ipixel_ready()) {
             was_ready = false;
-            drawing = false;
+            drawing = DRAW_NONE;
             continue;
         }
         if (!was_ready) {
@@ -208,47 +215,76 @@ static void send_task(void *arg)
         int64_t now_us = esp_timer_get_time();
         float dt = (now_us - last_us) / 1e6f;
         last_us = now_us;
-        fx_listen(native, dt);
         const uint8_t *lv = self_draw ? drawn : native;
         int n = self_draw ? count : IPIXEL_RHYTHM_BARS;
 
+        // Style 6: live disco. The panel stays in DIY mode and gets a new
+        // whole-panel picture as fast as it takes them (~2.4 a second).
+        if (disco) {
+            if (drawing != DRAW_DISCO) {
+                // Get the panel off its saved program first: entering DIY mode
+                // straight from it (e.g. starting up on style 6) left the saved
+                // program showing. One music-screen frame, then leave and enter
+                // DIY mode, as switching here from styles 0..5 does.
+                ipixel_build_rhythm(cmd, 0, native);
+                ipixel_write(cmd, sizeof cmd);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                draw_leave();
+                vTaskDelay(pdMS_TO_TICKS(100));
+                drawing = draw_enter() == 0 ? DRAW_DISCO : DRAW_NONE;
+                if (drawing == DRAW_NONE) {
+                    failed++;
+                    continue;
+                }
+                disco_last_us = now_us;
+            }
+            uint8_t *rgb = live_begin(pw, ph);
+            uint8_t avg[3] = {0};
+            int rc = -1;
+            if (rgb) {
+                disco_render(rgb, pw, ph, (now_us - disco_last_us) / 1e6f, avg);
+                disco_last_us = now_us;
+                rc = live_send();
+            }
+            if (rc == 0) {
+                sent++;
+                disco_frames++;
+            } else {
+                failed++;
+                last_err = rc;
+            }
+            ui_set_live_colour(avg[0], avg[1], avg[2]);
+            goto status;
+        }
+        if (drawing == DRAW_DISCO) {
+            draw_leave();
+            drawing = DRAW_NONE;
+        }
+
         // Silence: after SILENCE_S of empty bars stop sending; the panel goes
-        // back to its saved program (disco styles fade to black first). Wake as
-        // soon as a bar shows real sound. Timed in seconds, since disco frames
-        // come slower than FRAME_MS.
+        // back to its saved program. Wake as soon as a bar shows real sound.
         if (any_above(lv, n, idle ? 1 : 0)) {
             quiet_s = 0;
             if (idle) {
                 idle = false;
-                fade_left = 0;
                 ESP_LOGI(TAG, "sound again, streaming");
             }
-        } else if (!idle && (quiet_s += dt) >= SILENCE_S) {
+        } else if (!idle && !self_draw && (quiet_s += dt) >= SILENCE_S) {
+            // (Style 5 never pauses: silence is its 1-pixel line, and unchanged
+            // pixels cost nothing to keep.)
             idle = true;
-            fade_left = disco ? FADE_STEPS : 0;
-            ESP_LOGI(TAG, "quiet for %d s, %s", SILENCE_S, disco ? "fading to black" : "pausing");
+            ESP_LOGI(TAG, "quiet for %d s, pausing", SILENCE_S);
         }
 
-        // Fade the last disco picture to black over FADE_STEPS frames.
-        if (idle && fade_left > 0) {
-            uint8_t *rgb = live_begin(pw, ph);
-            if (rgb) {
-                float k = (float)(fade_left - 1) / fade_left;  // last step is all black
-                for (int i = 0; i < pw * ph * 3; i++) rgb[i] = (uint8_t)(rgb[i] * k);
-                live_send();
-            }
-            fade_left--;
-            ui_set_live_colour(0, 0, 0);
-            continue;
-        }
+        if (self_draw) idle = false;  // e.g. switched to style 5 while quiet
 
         // Switch the panel in or out of drawing mode as needed.
         bool want_drawing = self_draw && !idle;
-        if (drawing && !want_drawing) {
+        if (drawing == DRAW_BARS && !want_drawing) {
             draw_leave();
-            drawing = false;
-        } else if (!drawing && want_drawing) {
-            drawing = draw_enter() == 0;
+            drawing = DRAW_NONE;
+        } else if (!drawing && want_drawing && draw_enter() == 0) {
+            drawing = DRAW_BARS;
         }
         if (idle) {
             continue;
@@ -259,19 +295,6 @@ static void send_task(void *arg)
             // On failure draw.c marks the affected bars for a full redraw; no need
             // to clear the screen (a full redraw at once is what floods the link).
             rc = draw_frame(drawn, count, pw, h);
-        } else if (disco) {
-            // Whole-panel picture as a live frame. Confirmed writes make this
-            // block until the panel has it, which sets the frame rate.
-            uint8_t *rgb = live_begin(pw, ph);
-            uint8_t avg[3] = {0};
-            if (rgb) {
-                fx_render((fx_t)(s_style - STYLE_DISCO), rgb, pw, ph, dt, avg);
-                rc = live_send();
-                if (rc == 0) live_frames++;
-            } else {
-                rc = -1;
-            }
-            ui_set_live_colour(avg[0], avg[1], avg[2]);
         } else {
             ipixel_build_rhythm(cmd, s_style, native);
             rc = ipixel_write(cmd, sizeof cmd);
@@ -282,14 +305,21 @@ static void send_task(void *arg)
             failed++;
             last_err = rc;
         }
+    status:
         if (xTaskGetTickCount() - last_status >= pdMS_TO_TICKS(STATUS_MS)) {
             last_status = xTaskGetTickCount();
             ESP_LOGI(TAG, "status: style %u, %s, frames sent %lu, failed %lu (last error %d), "
-                     "live %.1f fps, last jpeg %d B, free heap %lu",
-                     s_style, drawing ? "self-draw" : disco ? "disco" : "music screen", (unsigned long)sent,
-                     (unsigned long)failed, last_err, live_frames * 1000.0f / STATUS_MS, live_last_size(),
+                     "disco %.1f fps, free heap %lu",
+                     s_style, drawing == DRAW_BARS ? "self-draw" : drawing == DRAW_DISCO ? "disco" : "music screen",
+                     (unsigned long)sent, (unsigned long)failed, last_err, disco_frames * 1000.0f / STATUS_MS,
                      (unsigned long)esp_get_free_heap_size());
-            live_frames = 0;
+            if (drawing == DRAW_DISCO) {
+                uint32_t a[5];
+                live_acks(a);
+                ESP_LOGI(TAG, "disco panel answers: next %lu, end of frame %lu, invalid %lu, timeouts %lu",
+                         (unsigned long)a[1], (unsigned long)a[2], (unsigned long)a[0], (unsigned long)a[4]);
+            }
+            disco_frames = 0;
         }
     }
 }
